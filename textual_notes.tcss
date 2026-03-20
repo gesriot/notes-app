@@ -1,0 +1,57 @@
+Screen {
+    background: #0f111a;
+    color: #f4f4f5;
+}
+
+#search {
+    dock: top;
+    margin: 0 1;
+}
+
+#main-layout {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 34;
+    min-width: 30;
+    max-width: 42;
+    border-right: tall #3b4261;
+    padding: 1;
+    background: #161925;
+}
+
+#note-list {
+    height: 1fr;
+    border: round #3b4261;
+    background: #1a1f2f;
+}
+
+.note-item {
+    height: 1;
+    padding: 0 1;
+}
+
+.note-item-text {
+    height: 1;
+    color: #f4f4f5;
+}
+
+#preview-column {
+    width: 1fr;
+    padding: 1;
+    background: #11131c;
+}
+
+#preview-scroll {
+    height: 1fr;
+    border: round #3b4261;
+    padding: 1;
+    background: #0f1320;
+}
+
+#preview {
+    padding: 0 1 1 1;
+    width: 1fr;
+    height: auto;
+}
