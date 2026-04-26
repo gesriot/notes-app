@@ -14,27 +14,46 @@ tags: ["graphrag", "query-processing", "retrieval", "generation"]
 
 ## Local Query Pipeline
 
+
+Эмбеддинги строятся по **обобщениям сущностей** (summary), а не по сырым описаниям.
+
 $$
 \mathbf{q} = \text{embed}(\text{Query}) \in \mathbb{R}^{1536}
 $$
 
 $$
-\{e_1, \dots, e_k\} = \text{TopK}(\text{similarity}(\mathbf{q}, E))
+\{e_1, \dots, e_k\} = \text{TopK}(\text{similarity}(\mathbf{q}, \text{embed}(\text{summary}(E))))
 $$
 
-$$
-\text{Context} = \text{GraphTraversal}(\{e_1, \dots, e_k\},\ \text{depth}=2)
-$$
+После нахождения релевантных сущностей система расширяет контекст через граф:
 
-## Global Query Pipeline
+| Источник | Содержимое |
+|----------|-----------|
+| **Чанки текста** | Исходные фрагменты, связанные с найденными сущностями |
+| **Сводки сообществ** | Отчёты сообществ, в которых состоят сущности |
+| **Связи** | Обобщённые описания рёбер между найденными сущностями |
+| **Сводки сущностей** | Consolidated summary каждой найденной сущности |
 
-$$
-\forall C_i:\ \text{PartialAnswer}_i = \text{LLM}(\text{Query},\ S_i)
-$$
+Все источники ранжируются и обрезаются до размера контекстного окна LLM.
 
+## Global Query Pipeline (Map-Reduce)
+
+
+Глобальный поиск работает как двухфазный map-reduce:
+
+**Фаза Map** — для каждого сообщества с рейтингом выше порога:
+$$
+\text{PartialAnswer}_i = \text{LLM}(\text{Query},\ S_i)
+$$
+Каждый промежуточный ответ содержит ключевые пункты с оценкой важности (0–100).
+
+**Фаза Reduce** — агрегация:
 $$
 \text{FinalAnswer} = \text{LLM}\!\left(\text{Query},\ \bigcup_i \text{PartialAnswer}_i\right)
 $$
+LLM синтезирует все промежуточные ответы в один финальный.
+
+> Качество ответа зависит от уровня иерархии сообществ: нижний уровень — детали, верхний — тематические обобщения.
 
 ## Алгоритм ранжирования
 
