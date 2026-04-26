@@ -24,9 +24,9 @@ struct Args {
 }
 
 struct App {
-    vault: Vault,
     notes: Vec<Note>,
     list_state: ListState,
+    preview_scroll: u16,
     should_quit: bool,
 }
 
@@ -43,9 +43,9 @@ impl App {
         }
 
         Ok(Self {
-            vault,
             notes,
             list_state,
+            preview_scroll: 0,
             should_quit: false,
         })
     }
@@ -58,24 +58,34 @@ impl App {
         if self.notes.is_empty() {
             return;
         }
-        let next = self
-            .list_state
-            .selected()
+        let current = self.list_state.selected();
+        let next = current
             .map(|i| (i + 1).min(self.notes.len() - 1))
             .unwrap_or(0);
         self.list_state.select(Some(next));
+        if current != Some(next) {
+            self.preview_scroll = 0;
+        }
     }
 
     fn previous_note(&mut self) {
         if self.notes.is_empty() {
             return;
         }
-        let prev = self
-            .list_state
-            .selected()
-            .map(|i| i.saturating_sub(1))
-            .unwrap_or(0);
+        let current = self.list_state.selected();
+        let prev = current.map(|i| i.saturating_sub(1)).unwrap_or(0);
         self.list_state.select(Some(prev));
+        if current != Some(prev) {
+            self.preview_scroll = 0;
+        }
+    }
+
+    fn scroll_preview_down(&mut self) {
+        self.preview_scroll = self.preview_scroll.saturating_add(5);
+    }
+
+    fn scroll_preview_up(&mut self) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(5);
     }
 }
 
@@ -104,6 +114,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
                         (KeyCode::Esc, _) => app.should_quit = true,
                         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.next_note(),
                         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.previous_note(),
+                        (KeyCode::PageDown, _) => app.scroll_preview_down(),
+                        (KeyCode::PageUp, _) => app.scroll_preview_up(),
                         _ => {}
                     }
                 }
@@ -152,7 +164,7 @@ fn search_placeholder() -> Paragraph<'static> {
 }
 
 fn footer() -> Paragraph<'static> {
-    Paragraph::new("↑/↓ или j/k: выбор  q/Ctrl+Q/Esc: выход")
+    Paragraph::new("↑/↓ или j/k: выбор  PgUp/PgDn: preview  q/Ctrl+Q/Esc: выход")
 }
 
 fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
@@ -180,20 +192,24 @@ fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rec
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_preview(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
     let preview = app
         .selected_note()
-        .map(|note| preview_text(app, note))
+        .map(preview_text)
         .unwrap_or_else(|| Text::from("Vault пуст или папка notes/ не найдена"));
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = preview.lines.len().saturating_sub(visible_height) as u16;
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
 
     let paragraph = Paragraph::new(preview)
         .block(Block::default().borders(Borders::ALL).title("Preview"))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.preview_scroll, 0));
 
     frame.render_widget(paragraph, area);
 }
 
-fn preview_text(app: &App, note: &Note) -> Text<'static> {
+fn preview_text(note: &Note) -> Text<'static> {
     let tags = if note.tags.is_empty() {
         "-".to_owned()
     } else {
@@ -209,18 +225,11 @@ fn preview_text(app: &App, note: &Note) -> Text<'static> {
             note.title.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!("Path: {}", note.path.display())),
-        Line::from(format!("Vault: {}", app.vault.root.display())),
         Line::from(format!("Tags: {tags}")),
-        Line::from(format!(
-            "Blocks: {}  Images: {}",
-            note.blocks.len(),
-            note.images.len()
-        )),
         Line::from(""),
     ];
 
-    for block in note.blocks.iter().take(6) {
+    for block in &note.blocks {
         match block {
             NoteBlock::Markdown(markdown) => {
                 lines.extend(markdown_to_text(markdown).lines);
