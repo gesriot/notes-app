@@ -5,7 +5,10 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use image::{ImageReader, image_dimensions};
-use notes_render::markdown::markdown_to_text;
+use notes_render::{
+    formula::{normalize_formula, render_formula},
+    markdown::markdown_to_text,
+};
 use notes_vault::{Note, NoteBlock, Vault};
 use ratatui::{
     Frame,
@@ -15,8 +18,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -52,11 +57,18 @@ struct ImageHitArea {
 struct ImageStore {
     picker: Picker,
     cache: HashMap<PathBuf, CachedImage>,
+    formula_cache: HashMap<String, CachedFormula>,
+    formula_cache_dir: PathBuf,
 }
 
 enum CachedImage {
     Ready(StatefulProtocol),
     Failed(String),
+}
+
+struct CachedFormula {
+    image: CachedImage,
+    pixel_size: Option<(u32, u32)>,
 }
 
 impl App {
@@ -71,6 +83,7 @@ impl App {
             list_state.select(Some(0));
         }
         let image_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        let formula_cache_dir = vault.root.join(".cache").join("formula");
 
         Ok(Self {
             notes,
@@ -79,10 +92,7 @@ impl App {
             list_items_area: Rect::default(),
             image_hit_areas: Vec::new(),
             fullscreen_image: None,
-            images: ImageStore {
-                picker: image_picker,
-                cache: HashMap::new(),
-            },
+            images: ImageStore::new(image_picker, formula_cache_dir),
             preview_cache: HashMap::new(),
             should_quit: false,
         })
@@ -196,6 +206,15 @@ impl App {
 }
 
 impl ImageStore {
+    fn new(picker: Picker, formula_cache_dir: PathBuf) -> Self {
+        Self {
+            picker,
+            cache: HashMap::new(),
+            formula_cache: HashMap::new(),
+            formula_cache_dir,
+        }
+    }
+
     fn cached_image(&mut self, path: &Path) -> &mut CachedImage {
         if !self.cache.contains_key(path) {
             let image = ImageReader::open(path)
@@ -212,6 +231,69 @@ impl ImageStore {
         self.cache
             .get_mut(path)
             .expect("image cache entry inserted before lookup")
+    }
+
+    fn cached_formula(&mut self, formula: &str) -> &mut CachedFormula {
+        let normalized = normalize_formula(formula);
+        if !self.formula_cache.contains_key(&normalized) {
+            let cached = self.load_or_render_formula(formula, &normalized);
+            self.formula_cache.insert(normalized.clone(), cached);
+        }
+
+        self.formula_cache
+            .get_mut(&normalized)
+            .expect("formula cache entry inserted before lookup")
+    }
+
+    fn load_or_render_formula(&mut self, formula: &str, normalized: &str) -> CachedFormula {
+        let cache_path = self.formula_cache_path(normalized);
+        if let Ok(png) = fs::read(&cache_path)
+            && let Ok(cached) = self.cached_formula_from_png(&png, None)
+        {
+            return cached;
+        }
+
+        match render_formula(formula) {
+            Ok(rendered) => {
+                let cached = self.cached_formula_from_png(
+                    &rendered.png,
+                    Some((rendered.width, rendered.height)),
+                );
+                match cached {
+                    Ok(cached) => {
+                        let _ = write_formula_cache(&cache_path, &rendered.png);
+                        cached
+                    }
+                    Err(error) => CachedFormula {
+                        image: CachedImage::Failed(error),
+                        pixel_size: None,
+                    },
+                }
+            }
+            Err(error) => CachedFormula {
+                image: CachedImage::Failed(error.to_string()),
+                pixel_size: None,
+            },
+        }
+    }
+
+    fn cached_formula_from_png(
+        &mut self,
+        png: &[u8],
+        pixel_size: Option<(u32, u32)>,
+    ) -> Result<CachedFormula, String> {
+        let image = image::load_from_memory(png).map_err(|error| error.to_string())?;
+        let pixel_size = pixel_size.or(Some((image.width(), image.height())));
+
+        Ok(CachedFormula {
+            image: CachedImage::Ready(self.picker.new_resize_protocol(image)),
+            pixel_size,
+        })
+    }
+
+    fn formula_cache_path(&self, normalized: &str) -> PathBuf {
+        self.formula_cache_dir
+            .join(format!("{}.png", sha1_hex(normalized)))
     }
 }
 
@@ -359,7 +441,7 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let note_key = app.notes[index].path.clone();
     if !app.preview_cache.contains_key(&note_key) {
-        let blocks = preview_blocks(&app.notes[index]);
+        let blocks = preview_blocks(&app.notes[index], &mut app.images);
         app.preview_cache.insert(note_key.clone(), blocks);
     }
     let preview_blocks = app
@@ -398,6 +480,10 @@ enum PreviewBlock {
         alt: String,
         pixel_size: Option<(u32, u32)>,
     },
+    Formula {
+        formula: String,
+        pixel_size: Option<(u32, u32)>,
+    },
 }
 
 impl PreviewBlock {
@@ -405,11 +491,12 @@ impl PreviewBlock {
         match self {
             Self::Text(text) => text.lines.len().max(1) as u16,
             Self::Image { pixel_size, .. } => image_height(*pixel_size, width, font_size),
+            Self::Formula { pixel_size, .. } => formula_height(*pixel_size, width, font_size),
         }
     }
 }
 
-fn preview_blocks(note: &Note) -> Vec<PreviewBlock> {
+fn preview_blocks(note: &Note, images: &mut ImageStore) -> Vec<PreviewBlock> {
     let tags = if note.tags.is_empty() {
         "-".to_owned()
     } else {
@@ -455,14 +542,14 @@ fn preview_blocks(note: &Note) -> Vec<PreviewBlock> {
                 blocks.push(PreviewBlock::Text(Text::from("")));
             }
             NoteBlock::Formula(formula) => {
-                blocks.push(PreviewBlock::Text(Text::from(vec![
-                    Line::from(Span::styled(
-                        "[formula]",
-                        Style::default().fg(Color::Magenta),
-                    )),
-                    Line::from(formula.clone()),
-                    Line::from(""),
-                ])));
+                // Эагерный рендер: получаем pixel_size сразу, чтобы layout был стабилен
+                // на первом фрейме и не дёргался после кэширования.
+                let pixel_size = images.cached_formula(formula).pixel_size;
+                blocks.push(PreviewBlock::Formula {
+                    formula: formula.clone(),
+                    pixel_size,
+                });
+                blocks.push(PreviewBlock::Text(Text::from("")));
             }
         }
     }
@@ -549,6 +636,34 @@ fn render_preview_blocks(
                 });
                 y = y.saturating_add(image_height);
             }
+            PreviewBlock::Formula { formula, .. } => {
+                if block_height == 0 {
+                    continue;
+                }
+
+                let available_height = bottom.saturating_sub(y);
+                if available_height == 0 {
+                    break;
+                }
+                if y != area.y && block_height > available_height {
+                    break;
+                }
+
+                let image_width = formula_image_width(area.width).min(area.width);
+                let image_height = block_height.min(available_height);
+                if image_width == 0 || image_height == 0 {
+                    break;
+                }
+
+                let block_area = Rect {
+                    x: area.x + area.width.saturating_sub(image_width) / 2,
+                    y,
+                    width: image_width,
+                    height: image_height,
+                };
+                render_formula_block(frame, images, block_area, formula);
+                y = y.saturating_add(image_height);
+            }
         }
 
         skip = 0;
@@ -606,19 +721,68 @@ fn render_image_block(
     }
 }
 
+fn render_formula_block(frame: &mut Frame<'_>, images: &mut ImageStore, area: Rect, formula: &str) {
+    if area.height < 2 {
+        return;
+    }
+
+    match &mut images.cached_formula(formula).image {
+        CachedImage::Ready(protocol) => {
+            let image = StatefulImage::default().resize(Resize::Scale(None));
+            frame.render_stateful_widget(image, area, protocol);
+            if let Some(Err(error)) = protocol.last_encoding_result() {
+                let fallback =
+                    Paragraph::new(format!("[formula render error: {error}]\n{formula}"))
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: false });
+                frame.render_widget(fallback, area);
+            }
+        }
+        CachedImage::Failed(error) => {
+            let fallback = Paragraph::new(format!("[formula error: {error}]\n{formula}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(fallback, area);
+        }
+    }
+}
+
 fn image_height(pixel_size: Option<(u32, u32)>, width: u16, font_size: (u16, u16)) -> u16 {
     const FALLBACK_HEIGHT: u16 = 6;
+    scaled_image_height(
+        pixel_size,
+        inline_image_width(width),
+        font_size,
+        FALLBACK_HEIGHT,
+    )
+}
+
+fn formula_height(pixel_size: Option<(u32, u32)>, width: u16, font_size: (u16, u16)) -> u16 {
+    const FALLBACK_HEIGHT: u16 = 4;
+    scaled_image_height(
+        pixel_size,
+        formula_image_width(width),
+        font_size,
+        FALLBACK_HEIGHT,
+    )
+}
+
+fn scaled_image_height(
+    pixel_size: Option<(u32, u32)>,
+    cell_width: u16,
+    font_size: (u16, u16),
+    fallback_height: u16,
+) -> u16 {
     const MIN_HEIGHT: u64 = 4;
 
     let Some((pixel_width, pixel_height)) = pixel_size else {
-        return FALLBACK_HEIGHT;
+        return fallback_height;
     };
-    let image_width = inline_image_width(width);
-    if pixel_width == 0 || pixel_height == 0 || image_width == 0 || font_size.1 == 0 {
-        return FALLBACK_HEIGHT;
+    if pixel_width == 0 || pixel_height == 0 || cell_width == 0 || font_size.1 == 0 {
+        return fallback_height;
     }
 
-    let target_pixel_width = u64::from(image_width) * u64::from(font_size.0.max(1));
+    let target_pixel_width = u64::from(cell_width) * u64::from(font_size.0.max(1));
     let height = (u64::from(pixel_height) * target_pixel_width)
         .div_ceil(u64::from(pixel_width) * u64::from(font_size.1))
         .clamp(MIN_HEIGHT, u64::from(u16::MAX));
@@ -630,6 +794,21 @@ fn inline_image_width(width: u16) -> u16 {
     if width == 0 { 0 } else { (width / 2).max(1) }
 }
 
+fn formula_image_width(width: u16) -> u16 {
+    width
+}
+
+fn write_formula_cache(path: &Path, png: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, png)
+}
+
+fn sha1_hex(value: &str) -> String {
+    format!("{:x}", Sha1::digest(value.as_bytes()))
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -639,7 +818,7 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_height, inline_image_width, rect_contains};
+    use super::{formula_height, image_height, inline_image_width, rect_contains};
     use ratatui::layout::Rect;
 
     #[test]
@@ -652,6 +831,11 @@ mod tests {
     #[test]
     fn image_height_scales_to_half_text_width() {
         assert_eq!(image_height(Some((1000, 500)), 80, (10, 20)), 10);
+    }
+
+    #[test]
+    fn formula_height_uses_full_text_width() {
+        assert_eq!(formula_height(Some((1000, 500)), 80, (10, 20)), 20);
     }
 
     #[test]

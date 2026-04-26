@@ -30,8 +30,8 @@ $$
 
 $$
 \text{Anomaly}(v) = \begin{cases}
-1 & \text{если } \text{score}(v) > \theta \\
-0 & \text{иначе}
+1 & \text{if } \text{score}(v) > \theta \\
+0 & \text{otherwise}
 \end{cases}
 $$
 
@@ -70,8 +70,8 @@ $$
 Решение: структурированные связи в графе гарантируют, что данные контракта привязаны к конкретному узлу `Contract` и не смешиваются.
 
 $$
-\text{VectorSearch}(\text{"условия оплаты"}) \to \text{чанки из разных контрактов (ошибка)}
+\text{VectorSearch}(\text{"payment terms"}) \to \text{chunks from different contracts (error)}
 $$
 $$
-\text{GraphQuery}(\text{ACME Inc.}) \to \text{только чанки контракта ACME (точно)}
+\text{GraphQuery}(\text{ACME Inc.}) \to \text{only ACME contract chunks (precise)}
 $$

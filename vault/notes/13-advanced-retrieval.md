@@ -10,7 +10,7 @@ tags: ["graphrag", "retrieval", "step-back", "parent-document", "embeddings", "r
 Эмбеддинг запроса пользователя и эмбеддинг нужного документа могут не совпасть из-за различий в терминологии или контексте — даже если документ семантически релевантен. Это называется **mismatch проблемой**.
 
 $$
-\text{sim}(\text{embed}(q),\ \text{embed}(d)) < \theta \quad \text{— документ пропущен, хотя релевантен}
+\text{sim}(\text{embed}(q),\ \text{embed}(d)) < \theta \quad \text{- relevant document skipped}
 $$
 
 ## Стратегия 1: Step-Back Prompting (промптинг с отступом)

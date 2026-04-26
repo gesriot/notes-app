@@ -13,7 +13,7 @@ tags: ["graphrag", "agentic", "agents", "retrieval", "llm"]
 ## Три компонента системы
 
 $$
-\text{UserQuery} \to \underbrace{\text{Retriever Router}}_{\text{выбор инструмента}} \to \underbrace{\text{Retriever Agent}}_{\text{получение данных}} \to \underbrace{\text{Answer Critic}}_{\text{проверка}}
+\text{UserQuery} \to \underbrace{\text{Retriever Router}}_{\text{tool selection}} \to \underbrace{\text{Retriever Agent}}_{\text{data retrieval}} \to \underbrace{\text{Answer Critic}}_{\text{critique}}
 $$
 
 ### 1. Агенты-ретриверы (Retriever Agents)

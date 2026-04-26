@@ -46,9 +46,9 @@ $$
 
 $$
 \text{Knowledge Graph Types:} \begin{cases}
-\text{Entity Graph} & \text{— основные сущности} \\
-\text{Relation Graph} & \text{— связи между сущностями} \\
-\text{Community Graph} & \text{— иерархия сообществ}
+\text{Entity Graph} & \text{- core entities} \\
+\text{Relation Graph} & \text{- entity relations} \\
+\text{Community Graph} & \text{- community hierarchy}
 \end{cases}
 $$
 

@@ -17,11 +17,14 @@ clap = { version = "4.5.50", features = ["derive"] }
 crossterm = "0.29.0"
 gray_matter = { version = "0.3.2", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+mathjax-svg-rs = "0.4.0"
 pulldown-cmark = "0.13.0"
 ratatui = "0.30.0"
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
 regex = "1.12.2"
+resvg = { version = "0.47.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
+sha1 = "0.10.6"
 thiserror = "2.0.17"
 unicode-width = "0.2.2"
 walkdir = "2.5.0"

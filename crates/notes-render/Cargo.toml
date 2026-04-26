@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+mathjax-svg-rs.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
+resvg.workspace = true
+thiserror.workspace = true
 unicode-width.workspace = true

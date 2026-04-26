@@ -84,7 +84,7 @@ GraphRAG **в 48 раз эффективнее** при query-focused summarizat
 При построении индекса GraphRAG LLM вызывается многократно:
 
 $$
-\text{Cost}_\text{index} = \underbrace{O(n \cdot t_\text{LLM})}_{\text{извлечение}} + \underbrace{O(|V| \cdot t_\text{LLM})}_{\text{обобщение сущностей}} + \underbrace{O(k \cdot t_\text{LLM})}_{\text{обобщение сообществ}}
+\text{Cost}_\text{index} = \underbrace{O(n \cdot t_\text{LLM})}_{\text{extraction}} + \underbrace{O(|V| \cdot t_\text{LLM})}_{\text{entity summarization}} + \underbrace{O(k \cdot t_\text{LLM})}_{\text{community summarization}}
 $$
 
 Это разовая стоимость при построении индекса. При обновлении данных нужно переиндексировать — существенный недостаток при динамичных данных.

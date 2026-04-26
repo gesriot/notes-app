@@ -14,3 +14,4 @@ notes-render = { path = "../notes-render" }
 notes-vault = { path = "../notes-vault" }
 ratatui.workspace = true
 ratatui-image.workspace = true
+sha1.workspace = true
