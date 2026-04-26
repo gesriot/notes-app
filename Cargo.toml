@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/notes-vault",
+    "crates/notes-render",
+    "crates/notes-tui",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.50", features = ["derive"] }
+crossterm = "0.29.0"
+gray_matter = { version = "0.3.2", default-features = false }
+pulldown-cmark = "0.13.0"
+ratatui = "0.30.0"
+regex = "1.12.2"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+walkdir = "2.5.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"

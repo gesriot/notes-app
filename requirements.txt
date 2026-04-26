@@ -1,5 +1,0 @@
-textual==8.1.1
-PyYAML==6.0.3
-textual-image[textual]==0.8.5
-pylatexenc==2.10
-matplotlib==3.10.8

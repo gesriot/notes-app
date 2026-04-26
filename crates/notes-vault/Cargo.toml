@@ -1,0 +1,13 @@
+[package]
+name = "notes-vault"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gray_matter = { workspace = true, features = ["yaml"] }
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
