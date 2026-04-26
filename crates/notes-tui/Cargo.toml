@@ -9,6 +9,8 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+image.workspace = true
 notes-render = { path = "../notes-render" }
 notes-vault = { path = "../notes-vault" }
 ratatui.workspace = true
+ratatui-image.workspace = true
