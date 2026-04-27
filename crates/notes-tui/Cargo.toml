@@ -12,6 +12,7 @@ crossterm.workspace = true
 image.workspace = true
 notes-render = { path = "../notes-render" }
 notes-vault = { path = "../notes-vault" }
+opener.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
 sha1.workspace = true

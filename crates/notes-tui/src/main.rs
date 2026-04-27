@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use image::{ImageReader, image_dimensions};
 use notes_render::{
@@ -12,7 +12,7 @@ use notes_render::{
 use notes_vault::{Note, NoteBlock, Vault};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -23,7 +23,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Parser)]
@@ -38,15 +38,34 @@ struct Args {
 }
 
 struct App {
+    vault: Vault,
     notes: Vec<Note>,
+    filtered_indices: Vec<usize>,
     list_state: ListState,
+    focus: Focus,
+    search_query: String,
+    search_area: Rect,
     preview_scroll: u16,
     list_items_area: Rect,
     image_hit_areas: Vec<ImageHitArea>,
+    focused_image: Option<usize>,
     fullscreen_image: Option<PathBuf>,
     images: ImageStore,
     preview_cache: HashMap<PathBuf, Vec<PreviewBlock>>,
+    notification: Option<Notification>,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Search,
+    List,
+    Preview,
+}
+
+struct Notification {
+    message: String,
+    expires_at: Instant,
 }
 
 struct ImageHitArea {
@@ -78,46 +97,55 @@ impl App {
             .load_notes()
             .with_context(|| format!("failed to load vault at {}", vault.root.display()))?;
 
-        let mut list_state = ListState::default();
-        if !notes.is_empty() {
-            list_state.select(Some(0));
-        }
         let image_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let formula_cache_dir = vault.root.join(".cache").join("formula");
 
-        Ok(Self {
+        let mut app = Self {
+            vault,
             notes,
-            list_state,
+            filtered_indices: Vec::new(),
+            list_state: ListState::default(),
+            focus: Focus::List,
+            search_query: String::new(),
+            search_area: Rect::default(),
             preview_scroll: 0,
             list_items_area: Rect::default(),
             image_hit_areas: Vec::new(),
+            focused_image: None,
             fullscreen_image: None,
             images: ImageStore::new(image_picker, formula_cache_dir),
             preview_cache: HashMap::new(),
+            notification: None,
             should_quit: false,
-        })
+        };
+        app.apply_filter(None);
+
+        Ok(app)
     }
 
-    fn selected_index(&self) -> Option<usize> {
-        self.list_state.selected()
+    fn selected_note_index(&self) -> Option<usize> {
+        self.list_state
+            .selected()
+            .and_then(|index| self.filtered_indices.get(index).copied())
     }
 
     fn next_note(&mut self) {
-        if self.notes.is_empty() {
+        if self.filtered_indices.is_empty() {
             return;
         }
         let current = self.list_state.selected();
         let next = current
-            .map(|i| (i + 1).min(self.notes.len() - 1))
+            .map(|i| (i + 1).min(self.filtered_indices.len() - 1))
             .unwrap_or(0);
         self.list_state.select(Some(next));
         if current != Some(next) {
             self.preview_scroll = 0;
+            self.focused_image = None;
         }
     }
 
     fn previous_note(&mut self) {
-        if self.notes.is_empty() {
+        if self.filtered_indices.is_empty() {
             return;
         }
         let current = self.list_state.selected();
@@ -125,7 +153,28 @@ impl App {
         self.list_state.select(Some(prev));
         if current != Some(prev) {
             self.preview_scroll = 0;
+            self.focused_image = None;
         }
+    }
+
+    fn page_notes_down(&mut self) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
+
+        let current = self.list_state.selected().unwrap_or(0);
+        let step = self.list_items_area.height.max(1) as usize;
+        self.select_note((current + step).min(self.filtered_indices.len() - 1));
+    }
+
+    fn page_notes_up(&mut self) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
+
+        let current = self.list_state.selected().unwrap_or(0);
+        let step = self.list_items_area.height.max(1) as usize;
+        self.select_note(current.saturating_sub(step));
     }
 
     fn scroll_preview_down(&mut self) {
@@ -145,7 +194,7 @@ impl App {
     }
 
     fn select_note(&mut self, index: usize) {
-        if index >= self.notes.len() {
+        if index >= self.filtered_indices.len() {
             return;
         }
 
@@ -153,7 +202,140 @@ impl App {
         self.list_state.select(Some(index));
         if current != Some(index) {
             self.preview_scroll = 0;
+            self.focused_image = None;
         }
+    }
+
+    fn focus_search(&mut self) {
+        self.focus = Focus::Search;
+    }
+
+    fn focus_list(&mut self) {
+        self.focus = Focus::List;
+    }
+
+    fn focus_preview(&mut self) {
+        self.focus = Focus::Preview;
+    }
+
+    fn push_search_char(&mut self, character: char) {
+        self.search_query.push(character);
+        self.apply_filter(None);
+    }
+
+    fn pop_search_char(&mut self) {
+        if self.search_query.pop().is_some() {
+            self.apply_filter(None);
+        }
+    }
+
+    fn clear_search(&mut self) {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.apply_filter(None);
+        }
+    }
+
+    fn reload_notes(&mut self) -> Result<()> {
+        let selected_path = self
+            .selected_note_index()
+            .map(|index| self.notes[index].path.clone());
+        self.notes = self
+            .vault
+            .load_notes()
+            .with_context(|| format!("failed to reload vault at {}", self.vault.root.display()))?;
+        self.preview_cache.clear();
+        self.images.cache.clear();
+        self.apply_filter(selected_path.as_deref());
+        self.notify(format!("Заметки перезагружены: {}", self.notes.len()));
+        Ok(())
+    }
+
+    fn apply_filter(&mut self, preferred_path: Option<&Path>) {
+        let tokens = search_tokens(&self.search_query);
+        self.filtered_indices = filter_note_indices(&self.notes, &tokens);
+
+        let selected = preferred_path
+            .and_then(|path| {
+                self.filtered_indices
+                    .iter()
+                    .position(|note_index| self.notes[*note_index].path == path)
+            })
+            .or_else(|| (!self.filtered_indices.is_empty()).then_some(0));
+
+        self.list_state = ListState::default();
+        self.list_state.select(selected);
+        self.preview_scroll = 0;
+        self.focused_image = None;
+    }
+
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notification = Some(Notification {
+            message: message.into(),
+            expires_at: Instant::now() + Duration::from_millis(1800),
+        });
+    }
+
+    fn selected_image_paths(&self) -> Vec<PathBuf> {
+        self.selected_note_index()
+            .and_then(|index| self.notes.get(index))
+            .map(|note| {
+                note.images
+                    .iter()
+                    .filter_map(|image| image.resolved.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn cycle_focused_image(&mut self, forward: bool) {
+        let images = self.selected_image_paths();
+        if images.is_empty() {
+            self.focused_image = None;
+            self.notify("В текущей заметке нет картинок");
+            return;
+        }
+
+        let current = self.focused_image.filter(|index| *index < images.len());
+        let next = match (current, forward) {
+            (Some(index), true) => (index + 1) % images.len(),
+            (Some(0), false) | (None, false) => images.len() - 1,
+            (Some(index), false) => index - 1,
+            (None, true) => 0,
+        };
+        self.focused_image = Some(next);
+        self.focus_preview();
+        self.notify(format!(
+            "Картинка {}/{}: {}",
+            next + 1,
+            images.len(),
+            images[next]
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+        ));
+    }
+
+    fn open_focused_image(&mut self) -> Result<()> {
+        let images = self.selected_image_paths();
+        let Some(path) = self
+            .focused_image
+            .and_then(|index| images.get(index))
+            .or_else(|| images.first())
+            .cloned()
+        else {
+            self.notify("В текущей заметке нет картинок");
+            return Ok(());
+        };
+
+        opener::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        self.notify(format!(
+            "Открыта картинка: {}",
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+        ));
+        Ok(())
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -163,19 +345,28 @@ impl App {
                     return;
                 }
 
+                if rect_contains(self.search_area, mouse.column, mouse.row) {
+                    self.focus_search();
+                    return;
+                }
+
                 if let Some(path) = self.image_path_at(mouse.column, mouse.row) {
+                    self.focus_preview();
                     self.fullscreen_image = Some(path);
                     return;
                 }
 
                 if let Some(index) = self.note_index_at(mouse.column, mouse.row) {
+                    self.focus_list();
                     self.select_note(index);
                 }
             }
             MouseEventKind::ScrollDown if self.fullscreen_image.is_none() => {
+                self.focus_preview();
                 self.scroll_preview_by(3)
             }
             MouseEventKind::ScrollUp if self.fullscreen_image.is_none() => {
+                self.focus_preview();
                 self.scroll_preview_by(-3)
             }
             _ => {}
@@ -201,7 +392,7 @@ impl App {
 
         let visible_row = row.saturating_sub(self.list_items_area.y) as usize;
         let index = self.list_state.offset().saturating_add(visible_row);
-        (index < self.notes.len()).then_some(index)
+        (index < self.filtered_indices.len()).then_some(index)
     }
 }
 
@@ -314,39 +505,123 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), modifiers)
-                            if modifiers.is_empty()
-                                || modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.should_quit = true;
-                        }
-                        (KeyCode::Esc, _) if app.close_fullscreen_image() => {}
-                        (KeyCode::Esc, _) => app.should_quit = true,
-                        _ if app.fullscreen_image.is_some() => {}
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.next_note(),
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.previous_note(),
-                        (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
-                            app.scroll_preview_down()
-                        }
-                        (KeyCode::PageUp, _) | (KeyCode::Char('b'), _) => app.scroll_preview_up(),
-                        (KeyCode::Char('d'), modifiers)
-                            if modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.scroll_preview_down()
-                        }
-                        (KeyCode::Char('u'), modifiers)
-                            if modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.scroll_preview_up()
-                        }
-                        _ => {}
+                    if let Err(error) = handle_key(&mut app, key) {
+                        app.notify(format!("{error:#}"));
                     }
                 }
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
         }
+    }
+
+    Ok(())
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+        app.should_quit = true;
+        return Ok(());
+    }
+
+    if app.fullscreen_image.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_fullscreen_image();
+            }
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                app.should_quit = true;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.focus == Focus::Search {
+        return handle_search_key(app, key);
+    }
+
+    handle_navigation_key(app, key)
+}
+
+fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc | KeyCode::Enter, _) => app.focus_list(),
+        (KeyCode::Backspace, _) => app.pop_search_char(),
+        (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.clear_search()
+        }
+        (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.focus_list()
+        }
+        (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.reload_notes()?
+        }
+        (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_focused_image()?
+        }
+        (KeyCode::Down, _) => app.next_note(),
+        (KeyCode::Up, _) => app.previous_note(),
+        (KeyCode::Char(character), modifiers)
+            if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+        {
+            app.push_search_char(character);
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), modifiers) if modifiers.is_empty() => {
+            app.should_quit = true;
+        }
+        (KeyCode::Esc, _) => app.should_quit = true,
+        (KeyCode::Char('/'), modifiers) if modifiers.is_empty() => app.focus_search(),
+        (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.focus_list()
+        }
+        (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.reload_notes()?
+        }
+        (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_focused_image()?
+        }
+        (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cycle_focused_image(true)
+        }
+        (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cycle_focused_image(false)
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            app.focus_list();
+            app.next_note();
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            app.focus_list();
+            app.previous_note();
+        }
+        (KeyCode::PageDown, _) if app.focus == Focus::List => app.page_notes_down(),
+        (KeyCode::PageUp, _) if app.focus == Focus::List => app.page_notes_up(),
+        (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+            app.focus_preview();
+            app.scroll_preview_down();
+        }
+        (KeyCode::PageUp, _) | (KeyCode::Char('b'), _) => {
+            app.focus_preview();
+            app.scroll_preview_up();
+        }
+        (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.focus_preview();
+            app.scroll_preview_down();
+        }
+        (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.focus_preview();
+            app.scroll_preview_up();
+        }
+        _ => {}
     }
 
     Ok(())
@@ -365,8 +640,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     frame.render_widget(header(), vertical[0]);
-    frame.render_widget(search_placeholder(), vertical[1]);
-    frame.render_widget(footer(), vertical[3]);
+    render_search(frame, app, vertical[1]);
+    frame.render_widget(footer(app), vertical[3]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -379,6 +654,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(path) = app.fullscreen_image.clone() {
         render_fullscreen_image(frame, &mut app.images, &path);
     }
+
+    render_notification(frame, app);
 }
 
 fn header() -> Paragraph<'static> {
@@ -388,27 +665,107 @@ fn header() -> Paragraph<'static> {
     ]))
 }
 
-fn search_placeholder() -> Paragraph<'static> {
-    Paragraph::new("/ Поиск по тегам будет подключен на этапе 5")
-        .block(Block::default().borders(Borders::ALL).title("Поиск"))
+fn render_search(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let is_focused = app.focus == Focus::Search;
+    let title = if is_focused {
+        "Поиск по тегам"
+    } else {
+        "Поиск"
+    };
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    app.search_area = area;
+    let query = if app.search_query.is_empty() {
+        Span::styled(
+            " / чтобы искать по тегам",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw(app.search_query.clone())
+    };
+
+    frame.render_widget(Paragraph::new(Line::from(query)).block(block), area);
+
+    if is_focused && inner.width > 0 && inner.height > 0 {
+        let cursor_offset = app
+            .search_query
+            .chars()
+            .count()
+            .min(inner.width.saturating_sub(1) as usize) as u16;
+        frame.set_cursor_position(Position::new(inner.x + cursor_offset, inner.y));
+    }
 }
 
-fn footer() -> Paragraph<'static> {
-    Paragraph::new(
-        "click/↑/↓: заметки  trackpad/Space/b: preview  click image: fullscreen  Esc: закрыть/выход  q: выход",
-    )
+fn footer(app: &App) -> Paragraph<'static> {
+    Paragraph::new(format!(
+        "{}  /:поиск  Ctrl+L:список  Ctrl+R:reload  Ctrl+↑/↓:картинки  Ctrl+O:open  Space/b:preview  q:выход",
+        focus_label(app.focus)
+    ))
+}
+
+fn focus_label(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Search => "Фокус: поиск",
+        Focus::List => "Фокус: список",
+        Focus::Preview => "Фокус: preview",
+    }
+}
+
+fn render_notification(frame: &mut Frame<'_>, app: &mut App) {
+    let Some(notification) = app.notification.as_ref() else {
+        return;
+    };
+    if Instant::now() >= notification.expires_at {
+        app.notification = None;
+        return;
+    }
+
+    let area = frame.area();
+    if area.width < 8 || area.height < 3 {
+        return;
+    }
+
+    let message = notification.message.clone();
+    let width =
+        (message.chars().count() as u16 + 4).clamp(12, area.width.saturating_sub(2).max(12));
+    let height = 3;
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height + 1),
+        width: width.min(area.width),
+        height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(message)
+            .block(block)
+            .style(Style::default().fg(Color::Yellow)),
+        popup,
+    );
 }
 
 fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
     let items = app
-        .notes
+        .filtered_indices
         .iter()
-        .map(|note| ListItem::new(note.title.clone()))
+        .map(|index| ListItem::new(app.notes[*index].title.clone()))
         .collect::<Vec<_>>();
 
     let block = Block::default().borders(Borders::ALL).title(format!(
         "Заметки {}/{}",
-        app.notes.len(),
+        app.filtered_indices.len(),
         app.notes.len()
     ));
     app.list_items_area = block.inner(area);
@@ -432,11 +789,13 @@ fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(index) = app.selected_index() else {
-        frame.render_widget(
-            Paragraph::new("Vault пуст или папка notes/ не найдена"),
-            inner,
-        );
+    let Some(index) = app.selected_note_index() else {
+        let message = if app.notes.is_empty() {
+            "Vault пуст или папка notes/ не найдена"
+        } else {
+            "Нет заметок по текущему фильтру"
+        };
+        frame.render_widget(Paragraph::new(message), inner);
         return;
     };
     let note_key = app.notes[index].path.clone();
@@ -809,6 +1168,34 @@ fn sha1_hex(value: &str) -> String {
     format!("{:x}", Sha1::digest(value.as_bytes()))
 }
 
+fn search_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|token| token.trim_start_matches('#').to_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn filter_note_indices(notes: &[Note], tokens: &[String]) -> Vec<usize> {
+    notes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, note)| note_matches_tokens(note, tokens).then_some(index))
+        .collect()
+}
+
+fn note_matches_tokens(note: &Note, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+
+    tokens.iter().all(|token| {
+        note.tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(token))
+    })
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -818,8 +1205,13 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{formula_height, image_height, inline_image_width, rect_contains};
+    use super::{
+        filter_note_indices, formula_height, image_height, inline_image_width, rect_contains,
+        search_tokens,
+    };
+    use notes_vault::Note;
     use ratatui::layout::Rect;
+    use std::path::PathBuf;
 
     #[test]
     fn image_width_uses_half_of_text_width() {
@@ -851,5 +1243,35 @@ mod tests {
         assert!(rect_contains(rect, 13, 7));
         assert!(!rect_contains(rect, 14, 7));
         assert!(!rect_contains(rect, 13, 8));
+    }
+
+    #[test]
+    fn search_tokens_strip_hashes_and_empty_parts() {
+        assert_eq!(
+            search_tokens("  #GraphRAG  rust  "),
+            vec!["graphrag".to_owned(), "rust".to_owned()]
+        );
+    }
+
+    #[test]
+    fn filters_notes_by_tag_tokens_with_and_semantics() {
+        let notes = vec![
+            note("a.md", &["graphrag", "rust"]),
+            note("b.md", &["graphrag"]),
+            note("c.md", &["rust"]),
+        ];
+        let tokens = search_tokens("graph rust");
+
+        assert_eq!(filter_note_indices(&notes, &tokens), [0]);
+    }
+
+    fn note(path: &str, tags: &[&str]) -> Note {
+        Note {
+            path: PathBuf::from(path),
+            title: path.to_owned(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            blocks: Vec::new(),
+            images: Vec::new(),
+        }
     }
 }
