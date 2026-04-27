@@ -168,11 +168,10 @@ impl TableState {
                 self.header_rows = self.rows.len();
                 self.in_head = false;
             }
-            Event::End(TagEnd::TableRow) => {
-                if !self.in_head && !self.current_row.is_empty() {
-                    self.rows.push(std::mem::take(&mut self.current_row));
-                }
+            Event::End(TagEnd::TableRow) if !self.in_head && !self.current_row.is_empty() => {
+                self.rows.push(std::mem::take(&mut self.current_row));
             }
+            Event::End(TagEnd::TableRow) => {}
             Event::End(TagEnd::Table) => return Some(self.render()),
             Event::Text(text) => self.current_cell.push_str(&inline_math_to_text(&text)),
             Event::Code(text) => {
@@ -378,16 +377,16 @@ fn math_expression_to_text(input: &str) -> String {
             .chars()
             .next()
             .expect("non-empty slice has at least one char");
-        if matches!(character, '_' | '^') {
-            if let Some((script, after_script)) = read_script(input, index + character.len_utf8()) {
-                if character == '_' {
-                    output.push_str(&subscript_text(&script));
-                } else {
-                    output.push_str(&superscript_text(&script));
-                }
-                index = after_script;
-                continue;
+        if matches!(character, '_' | '^')
+            && let Some((script, after_script)) = read_script(input, index + character.len_utf8())
+        {
+            if character == '_' {
+                output.push_str(&subscript_text(&script));
+            } else {
+                output.push_str(&superscript_text(&script));
             }
+            index = after_script;
+            continue;
         }
 
         if character == '\\' {

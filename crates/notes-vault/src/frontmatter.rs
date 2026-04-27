@@ -8,18 +8,13 @@ pub struct FrontMatter {
     pub tags: Tags,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
 pub enum Tags {
     List(Vec<String>),
     Csv(String),
+    #[default]
     None,
-}
-
-impl Default for Tags {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 pub fn normalize_tags(tags: Tags) -> Vec<String> {

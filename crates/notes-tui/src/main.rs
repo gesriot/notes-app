@@ -12,7 +12,7 @@ use notes_render::{
 use notes_vault::{Note, NoteBlock, Vault};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -20,11 +20,12 @@ use ratatui::{
 use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{BTreeSet, HashMap},
+    env, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "notes-tui", about = "Terminal vault notes viewer")]
@@ -35,6 +36,8 @@ struct Args {
         help = "Path to a vault containing notes/"
     )]
     vault: PathBuf,
+    #[arg(long, help = "Write debug logs to ~/.cache/notes-rs/log/notes-tui.log")]
+    debug: bool,
 }
 
 struct App {
@@ -52,6 +55,7 @@ struct App {
     fullscreen_image: Option<PathBuf>,
     images: ImageStore,
     preview_cache: HashMap<PathBuf, Vec<PreviewBlock>>,
+    show_tags_overlay: bool,
     notification: Option<Notification>,
     should_quit: bool,
 }
@@ -81,7 +85,7 @@ struct ImageStore {
 }
 
 enum CachedImage {
-    Ready(StatefulProtocol),
+    Ready(Box<StatefulProtocol>),
     Failed(String),
 }
 
@@ -96,6 +100,7 @@ impl App {
         let notes = vault
             .load_notes()
             .with_context(|| format!("failed to load vault at {}", vault.root.display()))?;
+        tracing::debug!(count = notes.len(), vault = %vault.root.display(), "loaded notes");
 
         let image_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let formula_cache_dir = vault.root.join(".cache").join("formula");
@@ -115,6 +120,7 @@ impl App {
             fullscreen_image: None,
             images: ImageStore::new(image_picker, formula_cache_dir),
             preview_cache: HashMap::new(),
+            show_tags_overlay: false,
             notification: None,
             should_quit: false,
         };
@@ -221,11 +227,13 @@ impl App {
     fn push_search_char(&mut self, character: char) {
         self.search_query.push(character);
         self.apply_filter(None);
+        tracing::debug!(query = %self.search_query, matches = self.filtered_indices.len(), "updated search query");
     }
 
     fn pop_search_char(&mut self) {
         if self.search_query.pop().is_some() {
             self.apply_filter(None);
+            tracing::debug!(query = %self.search_query, matches = self.filtered_indices.len(), "updated search query");
         }
     }
 
@@ -233,6 +241,7 @@ impl App {
         if !self.search_query.is_empty() {
             self.search_query.clear();
             self.apply_filter(None);
+            tracing::debug!("cleared search query");
         }
     }
 
@@ -247,6 +256,7 @@ impl App {
         self.preview_cache.clear();
         self.images.cache.clear();
         self.apply_filter(selected_path.as_deref());
+        tracing::info!(count = self.notes.len(), "reloaded notes");
         self.notify(format!("Заметки перезагружены: {}", self.notes.len()));
         Ok(())
     }
@@ -338,10 +348,25 @@ impl App {
         Ok(())
     }
 
+    fn toggle_tags_overlay(&mut self) {
+        self.show_tags_overlay = !self.show_tags_overlay;
+    }
+
+    fn close_tags_overlay(&mut self) -> bool {
+        let was_open = self.show_tags_overlay;
+        self.show_tags_overlay = false;
+        was_open
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.fullscreen_image.is_some() {
+                    return;
+                }
+
+                if self.show_tags_overlay {
+                    self.close_tags_overlay();
                     return;
                 }
 
@@ -413,7 +438,7 @@ impl ImageStore {
                 .and_then(|reader| reader.decode().map_err(|error| error.to_string()));
 
             let cached = match image {
-                Ok(image) => CachedImage::Ready(self.picker.new_resize_protocol(image)),
+                Ok(image) => CachedImage::Ready(Box::new(self.picker.new_resize_protocol(image))),
                 Err(error) => CachedImage::Failed(error),
             };
             self.cache.insert(path.to_path_buf(), cached);
@@ -477,7 +502,7 @@ impl ImageStore {
         let pixel_size = pixel_size.or(Some((image.width(), image.height())));
 
         Ok(CachedFormula {
-            image: CachedImage::Ready(self.picker.new_resize_protocol(image)),
+            image: CachedImage::Ready(Box::new(self.picker.new_resize_protocol(image))),
             pixel_size,
         })
     }
@@ -490,12 +515,53 @@ impl ImageStore {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    init_logging(args.debug)?;
+    tracing::info!(vault = %args.vault.display(), "starting notes-tui");
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, App::new(args.vault)?);
     crossterm::execute!(std::io::stdout(), DisableMouseCapture)?;
     ratatui::restore();
     result
+}
+
+fn init_logging(enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+
+    let log_dir = user_cache_dir().join("notes-rs").join("log");
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+    let log_path = log_dir.join("notes-tui.log");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open log file {}", log_path.display()))?;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("notes_tui=debug,notes_render=debug,notes_vault=debug,warn")
+    });
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(move || {
+            file.try_clone()
+                .expect("failed to clone notes-tui log file")
+        })
+        .try_init()
+        .ok();
+    tracing::info!(path = %log_path.display(), "debug logging enabled");
+
+    Ok(())
+}
+
+fn user_cache_dir() -> PathBuf {
+    env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
@@ -528,6 +594,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
                 app.close_fullscreen_image();
+            }
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                app.should_quit = true;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.show_tags_overlay {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('t') => {
+                app.close_tags_overlay();
             }
             KeyCode::Char('q') if key.modifiers.is_empty() => {
                 app.should_quit = true;
@@ -580,6 +659,7 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         (KeyCode::Esc, _) => app.should_quit = true,
         (KeyCode::Char('/'), modifiers) if modifiers.is_empty() => app.focus_search(),
+        (KeyCode::Char('t'), modifiers) if modifiers.is_empty() => app.toggle_tags_overlay(),
         (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.focus_list()
         }
@@ -595,6 +675,9 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent) -> Result<()> {
         (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             app.cycle_focused_image(false)
         }
+        (KeyCode::Char(']'), modifiers) if modifiers.is_empty() => app.cycle_focused_image(true),
+        (KeyCode::Char('['), modifiers) if modifiers.is_empty() => app.cycle_focused_image(false),
+        (KeyCode::Char('o'), modifiers) if modifiers.is_empty() => app.open_focused_image()?,
         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
             app.focus_list();
             app.next_note();
@@ -632,21 +715,19 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
         .split(area);
 
-    frame.render_widget(header(), vertical[0]);
-    render_search(frame, app, vertical[1]);
-    frame.render_widget(footer(app), vertical[3]);
+    render_search(frame, app, vertical[0]);
+    frame.render_widget(footer(app), vertical[2]);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(20)])
-        .split(vertical[2]);
+        .split(vertical[1]);
 
     render_notes(frame, app, main[0]);
     render_preview(frame, app, main[1]);
@@ -655,14 +736,11 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         render_fullscreen_image(frame, &mut app.images, &path);
     }
 
-    render_notification(frame, app);
-}
+    if app.show_tags_overlay {
+        render_tags_overlay(frame, app);
+    }
 
-fn header() -> Paragraph<'static> {
-    Paragraph::new(Line::from(vec![
-        Span::styled("Vault Notes", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" - поиск и просмотр заметок"),
-    ]))
+    render_notification(frame, app);
 }
 
 fn render_search(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -705,10 +783,13 @@ fn render_search(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn footer(app: &App) -> Paragraph<'static> {
-    Paragraph::new(format!(
-        "{}  /:поиск  Ctrl+L:список  Ctrl+R:reload  Ctrl+↑/↓:картинки  Ctrl+O:open  Space/b:preview  q:выход",
-        focus_label(app.focus)
-    ))
+    let help = match app.focus {
+        Focus::Search => "Esc/Enter:список  Ctrl+U:очистить  Ctrl+R:reload  Ctrl+Q:выход",
+        Focus::List => "/:поиск  t:теги  ↑↓/jk:заметки  PgUp/PgDn:лист  Space:preview  q:выход",
+        Focus::Preview => "wheel/Space/b:preview  []:картинки  o:open  t:теги  q:выход",
+    };
+
+    Paragraph::new(format!("{}  {help}", focus_label(app.focus)))
 }
 
 fn focus_label(focus: Focus) -> &'static str {
@@ -756,6 +837,46 @@ fn render_notification(frame: &mut Frame<'_>, app: &mut App) {
     );
 }
 
+fn render_tags_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    if area.width < 16 || area.height < 6 {
+        return;
+    }
+
+    let width = area.width.saturating_sub(8).clamp(24, 96).min(area.width);
+    let height = area.height.saturating_sub(6).clamp(6, 24).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let tags = all_tags(&app.notes);
+    let body = if tags.is_empty() {
+        "Тегов нет".to_owned()
+    } else {
+        tags.into_iter()
+            .map(|tag| format!("#{tag}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Теги")
+        .title_bottom("Esc/t: закрыть")
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White).bg(Color::Black)),
+        popup,
+    );
+}
+
 fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
     let items = app
         .filtered_indices
@@ -763,11 +884,14 @@ fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rec
         .map(|index| ListItem::new(app.notes[*index].title.clone()))
         .collect::<Vec<_>>();
 
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        "Заметки {}/{}",
-        app.filtered_indices.len(),
-        app.notes.len()
-    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title_alignment(Alignment::Center)
+        .title(format!(
+            "{}/{}",
+            app.filtered_indices.len(),
+            app.notes.len()
+        ));
     app.list_items_area = block.inner(area);
 
     let list = List::new(items)
@@ -785,7 +909,7 @@ fn render_notes(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rec
 }
 
 fn render_preview(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Preview");
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -856,24 +980,7 @@ impl PreviewBlock {
 }
 
 fn preview_blocks(note: &Note, images: &mut ImageStore) -> Vec<PreviewBlock> {
-    let tags = if note.tags.is_empty() {
-        "-".to_owned()
-    } else {
-        note.tags
-            .iter()
-            .map(|tag| format!("#{tag}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-
-    let mut blocks = vec![PreviewBlock::Text(Text::from(vec![
-        Line::from(Span::styled(
-            note.title.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("Tags: {tags}")),
-        Line::from(""),
-    ]))];
+    let mut blocks = Vec::new();
 
     for block in &note.blocks {
         match block {
@@ -911,6 +1018,22 @@ fn preview_blocks(note: &Note, images: &mut ImageStore) -> Vec<PreviewBlock> {
                 blocks.push(PreviewBlock::Text(Text::from("")));
             }
         }
+    }
+
+    if !note.tags.is_empty() {
+        let tags = note
+            .tags
+            .iter()
+            .map(|tag| format!("#{tag}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        blocks.push(PreviewBlock::Text(Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Tags: {tags}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])));
     }
 
     blocks
@@ -1063,7 +1186,7 @@ fn render_image_block(
     match images.cached_image(path) {
         CachedImage::Ready(protocol) => {
             let image = StatefulImage::default().resize(Resize::Scale(None));
-            frame.render_stateful_widget(image, area, protocol);
+            frame.render_stateful_widget(image, area, protocol.as_mut());
             if let Some(Err(error)) = protocol.last_encoding_result() {
                 let fallback = Paragraph::new(format!("[image render error: {alt} -> {error}]"))
                     .style(Style::default().fg(Color::Red))
@@ -1088,7 +1211,7 @@ fn render_formula_block(frame: &mut Frame<'_>, images: &mut ImageStore, area: Re
     match &mut images.cached_formula(formula).image {
         CachedImage::Ready(protocol) => {
             let image = StatefulImage::default().resize(Resize::Scale(None));
-            frame.render_stateful_widget(image, area, protocol);
+            frame.render_stateful_widget(image, area, protocol.as_mut());
             if let Some(Err(error)) = protocol.last_encoding_result() {
                 let fallback =
                     Paragraph::new(format!("[formula render error: {error}]\n{formula}"))
@@ -1196,6 +1319,15 @@ fn note_matches_tokens(note: &Note, tokens: &[String]) -> bool {
     })
 }
 
+fn all_tags(notes: &[Note]) -> Vec<String> {
+    notes
+        .iter()
+        .flat_map(|note| note.tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -1206,8 +1338,8 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_note_indices, formula_height, image_height, inline_image_width, rect_contains,
-        search_tokens,
+        all_tags, filter_note_indices, formula_height, image_height, inline_image_width,
+        rect_contains, search_tokens,
     };
     use notes_vault::Note;
     use ratatui::layout::Rect;
@@ -1263,6 +1395,19 @@ mod tests {
         let tokens = search_tokens("graph rust");
 
         assert_eq!(filter_note_indices(&notes, &tokens), [0]);
+    }
+
+    #[test]
+    fn collects_unique_tags_for_overlay() {
+        let notes = vec![
+            note("a.md", &["rust", "graphrag"]),
+            note("b.md", &["rust", "tui"]),
+        ];
+
+        assert_eq!(
+            all_tags(&notes),
+            vec!["graphrag".to_owned(), "rust".to_owned(), "tui".to_owned()]
+        );
     }
 
     fn note(path: &str, tags: &[&str]) -> Note {

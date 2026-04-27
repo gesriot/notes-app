@@ -108,8 +108,7 @@ fn fallback_title(path: &Path) -> String {
     path.file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Untitled")
-        .replace('-', " ")
-        .replace('_', " ")
+        .replace(['-', '_'], " ")
 }
 
 #[cfg(test)]

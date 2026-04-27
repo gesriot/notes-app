@@ -16,3 +16,5 @@ opener.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
 sha1.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
